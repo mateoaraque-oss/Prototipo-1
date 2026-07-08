@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Mis Agentes IA</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #f5f5f5; }
+    #root { max-width: 480px; margin: 0 auto; height: 100vh; display: flex; flex-direction: column; box-shadow: 0 0 20px rgba(0,0,0,0.1); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ===== STORAGE =====
+    const storage = {
+      getItem: (key) => localStorage.getItem(key),
+      setItem: (key, value) => localStorage.setItem(key, value),
+    };
+
+    // ===== APP =====
+    function App() {
+      const [screen, setScreen] = useState('Home');
+      const [params, setParams] = useState({});
+      const navigate = (to, p = {}) => { setScreen(to); setParams(p); };
+      const goBack = () => setScreen('Home');
+      const titles = { Home: 'Mis Agentes', CreateAgent: 'Nuevo Agente', Chat: params.agent?.name || 'Chat' };
+
+      return (
+        <div style={{ display:'flex', flexDirection:'column', height:'100vh' }}>
+          <div style={{ backgroundColor:'#f2f2f7', borderBottom:'1px solid #ddd', padding:'14px 16px', display:'flex', alignItems:'center', gap:10, minHeight:50 }}>
+            {screen !== 'Home' && (
+              <button onClick={goBack} style={{ background:'none', border:'none', fontSize:28, color:'#007AFF', cursor:'pointer', padding:'0 8px 0 0' }}>‹</button>
+            )}
+            <span style={{ fontSize:17, fontWeight:600 }}>{titles[screen]}</span>
+          </div>
+          {screen === 'Home'        && <HomeScreen navigate={navigate} />}
+          {screen === 'CreateAgent' && <CreateAgentScreen goBack={goBack} />}
+          {screen === 'Chat'        && <ChatScreen agent={params.agent} />}
+        </div>
+      );
+    }
+
+    // ===== HOME =====
+    function HomeScreen({ navigate }) {
+      const [agents, setAgents] = useState([]);
+
+      useEffect(() => {
+        const stored = storage.getItem('agents');
+        if (stored) setAgents(JSON.parse(stored));
+      }, []);
+
+      const deleteAgent = (id) => {
+        if (!window.confirm('¿Eliminar este agente?')) return;
+        const updated = agents.filter(a => a.id !== id);
+        storage.setItem('agents', JSON.stringify(updated));
+        setAgents(updated);
+      };
+
+      return (
+        <div style={{ flex:1, padding:20, overflowY:'auto', backgroundColor:'#f5f5f5' }}>
+          <button onClick={() => navigate('CreateAgent')}
+            style={{ backgroundColor:'#007AFF', color:'white', fontSize:18, fontWeight:'bold', padding:15, borderRadius:10, border:'none', width:'100%', cursor:'pointer', marginBottom:20 }}>
+            + Crear Nuevo Agente
+          </button>
+
+          {agents.length === 0 ? (
+            <div style={{ textAlign:'center', marginTop:100 }}>
+              <p style={{ fontSize:18, color:'#888' }}>No tienes agentes creados.</p>
+              <p style={{ fontSize:14, color:'#aaa', marginTop:10 }}>Toca "Crear Nuevo Agente" para empezar.</p>
+            </div>
+          ) : agents.map(item => (
+            <div key={item.id} style={{ display:'flex', backgroundColor:'#fff', borderRadius:10, padding:15, marginBottom:10, alignItems:'center', boxShadow:'0 1px 4px rgba(0,0,0,0.08)' }}>
+              <div style={{ flex:1, cursor:'pointer' }} onClick={() => navigate('Chat', { agent: item })}>
+                <p style={{ fontSize:18, fontWeight:'bold', marginBottom:4 }}>{item.name}</p>
+                <p style={{ fontSize:14, color:'#666', marginBottom:4 }}>{item.instructions.slice(0,80)}...</p>
+                <p style={{ fontSize:12, color:'#888' }}>🧠 {item.personality || 'Neutral'}</p>
+              </div>
+              <button onClick={() => deleteAgent(item.id)}
+                style={{ backgroundColor:'#FF3B30', color:'white', border:'none', borderRadius:'50%', width:30, height:30, cursor:'pointer', fontWeight:'bold', fontSize:14 }}>✕</button>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // ===== CREATE AGENT =====
+    function CreateAgentScreen({ goBack }) {
+      const [name, setName] = useState('');
+      const [instructions, setInstructions] = useState('');
+      const [personality, setPersonality] = useState('');
+
+      const saveAgent = () => {
+        if (!name.trim() || !instructions.trim()) { alert('Nombre e instrucciones son obligatorios'); return; }
+        const newAgent = { id: Date.now().toString(), name: name.trim(), instructions: instructions.trim(), personality: personality.trim() || 'Neutral' };
+        const stored = storage.getItem('agents');
+        const agents = stored ? JSON.parse(stored) : [];
+        agents.push(newAgent);
+        storage.setItem('agents', JSON.stringify(agents));
+        alert('✅ Agente creado correctamente');
+        goBack();
+      };
+
+      const inputStyle = { width:'100%', border:'1px solid #ccc', borderRadius:8, padding:10, fontSize:16, fontFamily:'inherit', marginBottom:10 };
+
+      return (
+        <div style={{ flex:1, padding:20, backgroundColor:'#fff', overflowY:'auto' }}>
+          <label style={{ fontSize:16, fontWeight:'bold', display:'block', marginTop:15, marginBottom:5 }}>Nombre del agente *</label>
+          <input style={inputStyle} value={name} onChange={e => setName(e.target.value)} placeholder="Ej: Asistente Legal" />
+
+          <label style={{ fontSize:16, fontWeight:'bold', display:'block', marginTop:15, marginBottom:5 }}>Instrucciones *</label>
+          <textarea style={{ ...inputStyle, height:100, resize:'vertical' }} value={instructions} onChange={e => setInstructions(e.target.value)} placeholder="Eres un abogado experto en derecho laboral..." />
+
+          <label style={{ fontSize:16, fontWeight:'bold', display:'block', marginTop:15, marginBottom:5 }}>Personalidad (opcional)</label>
+          <input style={inputStyle} value={personality} onChange={e => setPersonality(e.target.value)} placeholder="Ej: Formal, Amigable, Irónico" />
+
+          <button onClick={saveAgent}
+            style={{ backgroundColor:'#34C759', color:'white', fontSize:18, fontWeight:'bold', padding:15, borderRadius:10, border:'none', width:'100%', cursor:'pointer', marginTop:20 }}>
+            Guardar Agente
+          </button>
+        </div>
+      );
+    }
+
+    // ===== CHAT =====
+    function ChatScreen({ agent }) {
+      const [messages, setMessages] = useState([]);
+      const [input, setInput] = useState('');
+      const [loading, setLoading] = useState(false);
+      const bottomRef = useRef(null);
+
+      useEffect(() => {
+        const stored = storage.getItem(`conv_${agent.id}`);
+        if (stored) setMessages(JSON.parse(stored));
+      }, []);
+
+      useEffect(() => {
+        bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, [messages, loading]);
+
+      const sendMessage = async () => {
+        if (!input.trim() || loading) return;
+        const userMsg = { role: 'user', content: input };
+        const updated = [...messages, userMsg];
+        setMessages(updated);
+        setInput('');
+        setLoading(true);
+
+        try {
+          const systemPrompt = `Eres un agente de IA llamado "${agent.name}". Instrucciones: ${agent.instructions}. Personalidad: ${agent.personality || 'Neutral'}.`;
+          const resp = await fetch('https://api.deepseek.com/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer sk-09e6b32fac694a2ca84c5978d8deafe3' },
+            body: JSON.stringify({ model: 'deepseek-chat', max_tokens: 1000, messages: [{ role: 'system', content: systemPrompt }, ...updated] }),
+          });
+          const data = await resp.json();
+          const botMsg = { role: 'assistant', content: data.choices[0].message.content };
+          const final = [...updated, botMsg];
+          setMessages(final);
+          storage.setItem(`conv_${agent.id}`, JSON.stringify(final));
+        } catch {
+          alert('Error al conectar con la IA');
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      return (
+        <div style={{ display:'flex', flexDirection:'column', flex:1, overflow:'hidden' }}>
+          <div style={{ backgroundColor:'#fff', padding:'10px 16px', borderBottom:'1px solid #eee', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+            <span style={{ fontWeight:'bold' }}>{agent.name}</span>
+            <span style={{ fontSize:12, color:'#888' }}>🧠 {agent.personality || 'Neutral'}</span>
+          </div>
+
+          <div style={{ flex:1, overflowY:'auto', padding:10 }}>
+            {messages.length === 0 && <p style={{ textAlign:'center', color:'#aaa', marginTop:40 }}>Envía un mensaje para empezar.</p>}
+            {messages.map((m, i) => (
+              <div key={i} style={{ display:'flex', justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start', marginBottom:8 }}>
+                <div style={{ backgroundColor: m.role === 'user' ? '#007AFF' : '#e5e5ea', borderRadius:18, padding:'10px 14px', maxWidth:'80%' }}>
+                  <p style={{ fontSize:15, color: m.role === 'user' ? '#fff' : '#000', margin:0, whiteSpace:'pre-wrap' }}>{m.content}</p>
+                </div>
+              </div>
+            ))}
+            {loading && (
+              <div style={{ display:'flex', justifyContent:'flex-start', marginBottom:8 }}>
+                <div style={{ backgroundColor:'#e5e5ea', borderRadius:18, padding:'10px 14px' }}>
+                  <p style={{ margin:0, color:'#888' }}>...</p>
+                </div>
+              </div>
+            )}
+            <div ref={bottomRef} />
+          </div>
+
+          <div style={{ display:'flex', padding:10, backgroundColor:'#fff', borderTop:'1px solid #ddd', gap:10 }}>
+            <input
+              style={{ flex:1, border:'1px solid #ccc', borderRadius:20, padding:'10px 14px', fontSize:15, outline:'none' }}
+              value={input} onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && sendMessage()}
+              placeholder="Escribe tu mensaje..." disabled={loading} />
+            <button onClick={sendMessage} disabled={loading}
+              style={{ backgroundColor:'#007AFF', color:'white', border:'none', borderRadius:20, padding:'10px 18px', fontWeight:'bold', cursor:'pointer', opacity: loading ? 0.5 : 1 }}>
+              {loading ? '...' : 'Enviar'}
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
