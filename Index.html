@@ -7,10 +7,14 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script type="module">
+    // Carga perezosa de WebLLM (modelos open-source en el navegador vía WebGPU)
+    window.loadWebLLM = () => import('https://esm.run/@mlc-ai/web-llm');
+  </script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: system-ui, sans-serif; background: #f5f5f5; }
-    #root { max-width: 480px; margin: 0 auto; height: 100vh; display: flex; flex-direction: column; box-shadow: 0 0 20px rgba(0,0,0,0.1); }
+    #root { max-width: 480px; margin: 0 auto; height: 100vh; height: 100dvh; display: flex; flex-direction: column; box-shadow: 0 0 20px rgba(0,0,0,0.1); }
   </style>
 </head>
 <body>
@@ -21,9 +25,111 @@
 
     // ===== STORAGE =====
     const storage = {
-      getItem: (key) => localStorage.getItem(key),
-      setItem: (key, value) => localStorage.setItem(key, value),
+      getItem: (key) => { try { return localStorage.getItem(key); } catch { return null; } },
+      setItem: (key, value) => { try { localStorage.setItem(key, value); return true; } catch { return false; } },
+      removeItem: (key) => { try { localStorage.removeItem(key); } catch {} },
     };
+    const readJSON = (key, fallback) => { try { const v = storage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; } };
+
+    // ===== PROVEEDORES (todos con modelos open-source) =====
+    const PROVIDERS = {
+      webllm:     { label:'🌐 En tu navegador (gratis, sin key)', needsKey:false, models:['Qwen2.5-1.5B-Instruct-q4f16_1-MLC','Llama-3.2-1B-Instruct-q4f16_1-MLC','Qwen2.5-3B-Instruct-q4f16_1-MLC'] },
+      groq:       { label:'Groq — Llama 3.3 (key gratuita)', needsKey:true, baseUrl:'https://api.groq.com/openai/v1', models:['llama-3.3-70b-versatile','llama-3.1-8b-instant'], link:'console.groq.com/keys' },
+      openrouter: { label:'OpenRouter — modelos abiertos', needsKey:true, baseUrl:'https://openrouter.ai/api/v1', models:['meta-llama/llama-3.3-70b-instruct:free','qwen/qwen-2.5-72b-instruct:free'], link:'openrouter.ai/keys' },
+      deepseek:   { label:'DeepSeek (pesos abiertos)', needsKey:true, baseUrl:'https://api.deepseek.com/v1', models:['deepseek-chat'], link:'platform.deepseek.com' },
+      custom:     { label:'Ollama / servidor compatible OpenAI', needsKey:false, baseUrl:'http://localhost:11434/v1', models:['llama3.2'] },
+    };
+    const DEFAULT_SETTINGS = { provider:'webllm', keys:{}, models:{}, customUrl:'http://localhost:11434/v1' };
+    const getSettings = () => ({ ...DEFAULT_SETTINGS, ...readJSON('settings_v2', {}) });
+    const activeConfig = (st) => {
+      const p = PROVIDERS[st.provider];
+      return { provider: st.provider, def: p, apiKey: st.keys[st.provider] || '', model: st.models[st.provider] || p.models[0], baseUrl: st.provider === 'custom' ? st.customUrl : p.baseUrl };
+    };
+
+    // ===== HERRAMIENTAS =====
+    const TOOLS = {
+      calculadora: {
+        label:'🧮 Calculadora', desc:'Evalúa una expresión matemática. args: {"expression":"2*(3+4)"}',
+        run: ({ expression }) => {
+          const e = String(expression || '').replace(/\^/g, '**').replace(/,/g, '.');
+          if (!/^[0-9+\-*/().%\s]+$/.test(e)) throw new Error('Expresión no válida');
+          const r = Function(`"use strict"; return (${e})`)();
+          if (typeof r !== 'number' || !isFinite(r)) throw new Error('Resultado no válido');
+          return String(r);
+        },
+      },
+      fecha_hora: {
+        label:'🕒 Fecha y hora', desc:'Devuelve la fecha y hora actual del usuario. args: {}',
+        run: () => new Date().toLocaleString('es', { dateStyle:'full', timeStyle:'long' }),
+      },
+      wikipedia: {
+        label:'📚 Wikipedia', desc:'Busca un tema en Wikipedia y devuelve un resumen. args: {"query":"Albert Einstein"}',
+        run: async ({ query }, signal) => {
+          const q = encodeURIComponent(String(query || ''));
+          const s = await (await fetch(`https://es.wikipedia.org/w/api.php?action=query&list=search&srsearch=${q}&srlimit=1&format=json&origin=*`, { signal })).json();
+          const hit = s?.query?.search?.[0];
+          if (!hit) return 'Sin resultados.';
+          const ex = await (await fetch(`https://es.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&titles=${encodeURIComponent(hit.title)}&format=json&origin=*`, { signal })).json();
+          const page = Object.values(ex.query.pages)[0];
+          return `${hit.title}: ${(page.extract || '').slice(0, 1500)}`;
+        },
+      },
+    };
+    const toolsPrompt = (ids) => !ids?.length ? '' :
+      `\n\nTienes herramientas. Para usar una, responde ÚNICAMENTE con esta línea, sin nada más:\n<tool>{"name":"NOMBRE","args":{...}}</tool>\nRecibirás el resultado y entonces responde al usuario con él. Si no necesitas herramientas, responde normalmente. Herramientas:\n` +
+      ids.map(id => `- ${id}: ${TOOLS[id].desc}`).join('\n');
+    const parseToolCall = (text) => {
+      const m = text.match(/<tool>([\s\S]*?)<\/tool>/);
+      if (!m) return null;
+      try { const c = JSON.parse(m[1]); return TOOLS[c.name] ? { name: c.name, args: c.args || {} } : { name: c.name, args: {}, invalid: true }; } catch { return { name:'?', args:{}, invalid: true }; }
+    };
+
+    // ===== MOTOR LLM =====
+    let webllmEngine = null, webllmModel = null, onWebllmProgress = () => {};
+    async function getWebllm(model) {
+      if (!navigator.gpu) throw new Error('Tu navegador no soporta WebGPU. Usa Chrome/Edge de escritorio o elige otro proveedor en Ajustes.');
+      if (webllmEngine && webllmModel === model) return webllmEngine;
+      const webllm = await window.loadWebLLM();
+      webllmEngine = await webllm.CreateMLCEngine(model, { initProgressCallback: (p) => onWebllmProgress(p.text || '') });
+      webllmModel = model;
+      return webllmEngine;
+    }
+    const httpError = (status, msg) => new Error(status === 401 ? 'API key inválida (401). Revísala en Ajustes.' : status === 402 ? 'Saldo insuficiente (402).' : status === 429 ? 'Demasiadas peticiones (429). Espera un momento.' : msg || `Error HTTP ${status}`);
+
+    async function streamCompletion({ cfg, messages, onToken, signal }) {
+      let full = '';
+      if (cfg.provider === 'webllm') {
+        const engine = await getWebllm(cfg.model);
+        const onAbort = () => engine.interruptGenerate();
+        signal.addEventListener('abort', onAbort);
+        try {
+          const chunks = await engine.chat.completions.create({ messages, stream:true, max_tokens:1000 });
+          for await (const c of chunks) { const t = c.choices[0]?.delta?.content || ''; full += t; onToken(full); }
+        } finally { signal.removeEventListener('abort', onAbort); }
+        return full;
+      }
+      const headers = { 'Content-Type':'application/json' };
+      if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
+      const resp = await fetch(`${cfg.baseUrl.replace(/\/+$/, '')}/chat/completions`, { method:'POST', signal, headers, body: JSON.stringify({ model: cfg.model, messages, stream:true, max_tokens:1000 }) });
+      if (!resp.ok) { const d = await resp.json().catch(() => ({})); throw httpError(resp.status, d?.error?.message); }
+      const reader = resp.body.getReader(), dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream:true });
+        const lines = buf.split('\n'); buf = lines.pop();
+        for (const line of lines) {
+          const l = line.trim();
+          if (!l.startsWith('data:')) continue;
+          const d = l.slice(5).trim();
+          if (d === '[DONE]') continue;
+          try { const t = JSON.parse(d).choices?.[0]?.delta?.content || ''; if (t) { full += t; onToken(full); } } catch {}
+        }
+      }
+      if (!full) throw new Error('Respuesta vacía de la IA.');
+      return full;
+    }
 
     // ===== APP =====
     function App() {
@@ -31,19 +137,23 @@
       const [params, setParams] = useState({});
       const navigate = (to, p = {}) => { setScreen(to); setParams(p); };
       const goBack = () => setScreen('Home');
-      const titles = { Home: 'Mis Agentes', CreateAgent: 'Nuevo Agente', Chat: params.agent?.name || 'Chat' };
+      const titles = { Home: 'Mis Agentes', CreateAgent: params.agent ? 'Editar Agente' : 'Nuevo Agente', Chat: params.agent?.name || 'Chat', Settings: 'Ajustes' };
 
       return (
-        <div style={{ display:'flex', flexDirection:'column', height:'100vh' }}>
+        <div style={{ display:'flex', flexDirection:'column', height:'100%' }}>
           <div style={{ backgroundColor:'#f2f2f7', borderBottom:'1px solid #ddd', padding:'14px 16px', display:'flex', alignItems:'center', gap:10, minHeight:50 }}>
             {screen !== 'Home' && (
               <button onClick={goBack} style={{ background:'none', border:'none', fontSize:28, color:'#007AFF', cursor:'pointer', padding:'0 8px 0 0' }}>‹</button>
             )}
-            <span style={{ fontSize:17, fontWeight:600 }}>{titles[screen]}</span>
+            <span style={{ fontSize:17, fontWeight:600, flex:1 }}>{titles[screen]}</span>
+            {screen === 'Home' && (
+              <button onClick={() => navigate('Settings')} title="Ajustes" style={{ background:'none', border:'none', fontSize:22, cursor:'pointer' }}>⚙️</button>
+            )}
           </div>
           {screen === 'Home'        && <HomeScreen navigate={navigate} />}
-          {screen === 'CreateAgent' && <CreateAgentScreen goBack={goBack} />}
-          {screen === 'Chat'        && <ChatScreen agent={params.agent} />}
+          {screen === 'CreateAgent' && <CreateAgentScreen goBack={goBack} agent={params.agent} />}
+          {screen === 'Settings'    && <SettingsScreen />}
+          {screen === 'Chat'        && <ChatScreen key={params.agent.id} agent={params.agent} navigate={navigate} />}
         </div>
       );
     }
@@ -53,14 +163,14 @@
       const [agents, setAgents] = useState([]);
 
       useEffect(() => {
-        const stored = storage.getItem('agents');
-        if (stored) setAgents(JSON.parse(stored));
+        setAgents(readJSON('agents', []));
       }, []);
 
       const deleteAgent = (id) => {
         if (!window.confirm('¿Eliminar este agente?')) return;
         const updated = agents.filter(a => a.id !== id);
         storage.setItem('agents', JSON.stringify(updated));
+        storage.removeItem(`conv_${id}`);
         setAgents(updated);
       };
 
@@ -81,8 +191,10 @@
               <div style={{ flex:1, cursor:'pointer' }} onClick={() => navigate('Chat', { agent: item })}>
                 <p style={{ fontSize:18, fontWeight:'bold', marginBottom:4 }}>{item.name}</p>
                 <p style={{ fontSize:14, color:'#666', marginBottom:4 }}>{item.instructions.slice(0,80)}...</p>
-                <p style={{ fontSize:12, color:'#888' }}>🧠 {item.personality || 'Neutral'}</p>
+                <p style={{ fontSize:12, color:'#888' }}>🧠 {item.personality || 'Neutral'}{item.tools?.length ? ` · 🔧 ${item.tools.length}` : ''}</p>
               </div>
+              <button onClick={() => navigate('CreateAgent', { agent: item })} title="Editar"
+                style={{ backgroundColor:'#8E8E93', color:'white', border:'none', borderRadius:'50%', width:30, height:30, cursor:'pointer', fontSize:14, marginRight:8 }}>✎</button>
               <button onClick={() => deleteAgent(item.id)}
                 style={{ backgroundColor:'#FF3B30', color:'white', border:'none', borderRadius:'50%', width:30, height:30, cursor:'pointer', fontWeight:'bold', fontSize:14 }}>✕</button>
             </div>
@@ -92,19 +204,21 @@
     }
 
     // ===== CREATE AGENT =====
-    function CreateAgentScreen({ goBack }) {
-      const [name, setName] = useState('');
-      const [instructions, setInstructions] = useState('');
-      const [personality, setPersonality] = useState('');
+    function CreateAgentScreen({ goBack, agent }) {
+      const [name, setName] = useState(agent?.name || '');
+      const [instructions, setInstructions] = useState(agent?.instructions || '');
+      const [personality, setPersonality] = useState(agent?.personality && agent.personality !== 'Neutral' ? agent.personality : '');
+      const [tools, setTools] = useState(agent?.tools || []);
+      const toggleTool = (id) => setTools(t => t.includes(id) ? t.filter(x => x !== id) : [...t, id]);
 
       const saveAgent = () => {
         if (!name.trim() || !instructions.trim()) { alert('Nombre e instrucciones son obligatorios'); return; }
-        const newAgent = { id: Date.now().toString(), name: name.trim(), instructions: instructions.trim(), personality: personality.trim() || 'Neutral' };
-        const stored = storage.getItem('agents');
-        const agents = stored ? JSON.parse(stored) : [];
-        agents.push(newAgent);
-        storage.setItem('agents', JSON.stringify(agents));
-        alert('✅ Agente creado correctamente');
+        const data = { name: name.trim(), instructions: instructions.trim(), personality: personality.trim() || 'Neutral', tools };
+        const agents = readJSON('agents', []);
+        const next = agent
+          ? agents.map(a => a.id === agent.id ? { ...a, ...data } : a)
+          : [...agents, { id: Date.now().toString(), ...data }];
+        if (!storage.setItem('agents', JSON.stringify(next))) { alert('No se pudo guardar (almacenamiento no disponible)'); return; }
         goBack();
       };
 
@@ -121,78 +235,168 @@
           <label style={{ fontSize:16, fontWeight:'bold', display:'block', marginTop:15, marginBottom:5 }}>Personalidad (opcional)</label>
           <input style={inputStyle} value={personality} onChange={e => setPersonality(e.target.value)} placeholder="Ej: Formal, Amigable, Irónico" />
 
+          <label style={{ fontSize:16, fontWeight:'bold', display:'block', marginTop:15, marginBottom:5 }}>Herramientas</label>
+          {Object.entries(TOOLS).map(([id, t]) => (
+            <label key={id} style={{ display:'flex', alignItems:'center', gap:8, padding:'6px 0', fontSize:15 }}>
+              <input type="checkbox" checked={tools.includes(id)} onChange={() => toggleTool(id)} /> {t.label}
+            </label>
+          ))}
+
           <button onClick={saveAgent}
             style={{ backgroundColor:'#34C759', color:'white', fontSize:18, fontWeight:'bold', padding:15, borderRadius:10, border:'none', width:'100%', cursor:'pointer', marginTop:20 }}>
-            Guardar Agente
+            {agent ? 'Guardar Cambios' : 'Guardar Agente'}
           </button>
         </div>
       );
     }
 
+    // ===== SETTINGS =====
+    function SettingsScreen() {
+      const [st, setSt] = useState(getSettings());
+      const [saved, setSaved] = useState(false);
+      const cfg = activeConfig(st);
+      const upd = (patch) => { setSaved(false); setSt({ ...st, ...patch }); };
+      const save = () => { if (!storage.setItem('settings_v2', JSON.stringify(st))) alert('No se pudo guardar'); else setSaved(true); };
+      const inputStyle = { width:'100%', border:'1px solid #ccc', borderRadius:8, padding:10, fontSize:16, fontFamily:'inherit', marginBottom:10 };
+      const label = { fontSize:16, fontWeight:'bold', display:'block', marginTop:15, marginBottom:5 };
+      return (
+        <div style={{ flex:1, padding:20, backgroundColor:'#fff', overflowY:'auto' }}>
+          <label style={label}>Modelo de IA</label>
+          <select style={inputStyle} value={st.provider} onChange={e => upd({ provider: e.target.value })}>
+            {Object.entries(PROVIDERS).map(([id, p]) => <option key={id} value={id}>{p.label}</option>)}
+          </select>
+          {st.provider === 'webllm' && <p style={{ fontSize:12, color:'#888', marginBottom:10 }}>Se descarga una sola vez (~1 GB) y corre 100% en tu dispositivo: privado y gratis. Requiere WebGPU (Chrome/Edge de escritorio).</p>}
+
+          {st.provider === 'custom' && (<>
+            <label style={label}>URL del servidor</label>
+            <input style={inputStyle} value={st.customUrl} onChange={e => upd({ customUrl: e.target.value })} />
+          </>)}
+
+          <label style={label}>Modelo</label>
+          <input style={inputStyle} list="model-list" value={cfg.model} onChange={e => upd({ models: { ...st.models, [st.provider]: e.target.value } })} />
+          <datalist id="model-list">{cfg.def.models.map(m => <option key={m} value={m} />)}</datalist>
+
+          {cfg.def.needsKey && (<>
+            <label style={label}>API Key</label>
+            <input style={inputStyle} type="password" autoComplete="off" value={cfg.apiKey} placeholder="Pega tu key"
+              onChange={e => upd({ keys: { ...st.keys, [st.provider]: e.target.value.trim() } })} />
+            <p style={{ fontSize:12, color:'#888', marginBottom:10 }}>Consíguela en {cfg.def.link}. Se guarda solo en este navegador y se envía únicamente a ese proveedor.</p>
+          </>)}
+
+          <button onClick={save} style={{ backgroundColor:'#34C759', color:'white', fontSize:18, fontWeight:'bold', padding:15, borderRadius:10, border:'none', width:'100%', cursor:'pointer', marginTop:20 }}>Guardar</button>
+          {saved && <p style={{ color:'#34C759', textAlign:'center', marginTop:10 }}>✅ Guardado</p>}
+        </div>
+      );
+    }
+
     // ===== CHAT =====
-    function ChatScreen({ agent }) {
-      const [messages, setMessages] = useState([]);
+    const MAX_HISTORY = 30, MAX_TOOL_STEPS = 4;
+    const stripTool = (t) => t.replace(/<tool>[\s\S]*?<\/tool>/g, '').trim();
+    function ChatScreen({ agent, navigate }) {
+      const [messages, setMessages] = useState(() => readJSON(`conv_${agent.id}`, []));
       const [input, setInput] = useState('');
       const [loading, setLoading] = useState(false);
+      const [streaming, setStreaming] = useState('');
+      const [status, setStatus] = useState('');
+      const [error, setError] = useState('');
       const bottomRef = useRef(null);
+      const abortRef = useRef(null);
+      const cfg = activeConfig(getSettings());
+      const missingKey = cfg.def.needsKey && !cfg.apiKey;
 
-      useEffect(() => {
-        const stored = storage.getItem(`conv_${agent.id}`);
-        if (stored) setMessages(JSON.parse(stored));
-      }, []);
+      useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:'smooth' }); }, [messages, streaming, loading, error, status]);
+      useEffect(() => () => abortRef.current?.abort(), []);
 
-      useEffect(() => {
-        bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-      }, [messages, loading]);
+      const persist = (list) => { setMessages(list); storage.setItem(`conv_${agent.id}`, JSON.stringify(list.slice(-200))); };
 
-      const sendMessage = async () => {
-        if (!input.trim() || loading) return;
-        const userMsg = { role: 'user', content: input };
-        const updated = [...messages, userMsg];
-        setMessages(updated);
-        setInput('');
-        setLoading(true);
+      const clearChat = () => {
+        if (!window.confirm('¿Borrar toda la conversación?')) return;
+        abortRef.current?.abort();
+        storage.removeItem(`conv_${agent.id}`);
+        setMessages([]); setError(''); setLoading(false); setStreaming(''); setStatus('');
+      };
+      const stop = () => abortRef.current?.abort();
 
+      const toApi = (list) => list.slice(-MAX_HISTORY).map(m => m.role === 'tool'
+        ? { role:'user', content:`[Resultado de ${m.tool}]: ${m.content}` } : { role:m.role, content:m.content });
+
+      const run = async (startList) => {
+        const controller = new AbortController();
+        abortRef.current = controller;
+        setError(''); setLoading(true);
+        onWebllmProgress = (t) => setStatus(t);
+        let list = startList;
+        const system = `Eres un agente de IA llamado "${agent.name}". Instrucciones: ${agent.instructions}. Personalidad: ${agent.personality || 'Neutral'}. Responde siempre en el idioma del usuario.` + toolsPrompt(agent.tools);
         try {
-          const systemPrompt = `Eres un agente de IA llamado "${agent.name}". Instrucciones: ${agent.instructions}. Personalidad: ${agent.personality || 'Neutral'}.`;
-          const resp = await fetch('https://api.deepseek.com/v1/chat/completions', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer sk-09e6b32fac694a2ca84c5978d8deafe3' },
-            body: JSON.stringify({ model: 'deepseek-chat', max_tokens: 1000, messages: [{ role: 'system', content: systemPrompt }, ...updated] }),
-          });
-          const data = await resp.json();
-          const botMsg = { role: 'assistant', content: data.choices[0].message.content };
-          const final = [...updated, botMsg];
-          setMessages(final);
-          storage.setItem(`conv_${agent.id}`, JSON.stringify(final));
-        } catch {
-          alert('Error al conectar con la IA');
+          for (let step = 0; step <= MAX_TOOL_STEPS; step++) {
+            setStatus(cfg.provider === 'webllm' && !webllmEngine ? 'Cargando modelo…' : '');
+            const text = await streamCompletion({ cfg, signal: controller.signal, onToken: (t) => { setStatus(''); setStreaming(stripTool(t)); }, messages: [{ role:'system', content:system }, ...toApi(list)] });
+            setStreaming('');
+            list = [...list, { role:'assistant', content:text }];
+            persist(list);
+            const call = agent.tools?.length && step < MAX_TOOL_STEPS ? parseToolCall(text) : null;
+            if (!call) break;
+            setStatus(`🔧 Usando ${call.name}…`);
+            let result;
+            try {
+              if (call.invalid) throw new Error('Herramienta no disponible');
+              result = String(await TOOLS[call.name].run(call.args, controller.signal));
+            } catch (e) { if (e.name === 'AbortError') throw e; result = `Error: ${e.message}`; }
+            list = [...list, { role:'tool', tool:call.name, content:result }];
+            persist(list);
+          }
+        } catch (e) {
+          if (e.name !== 'AbortError') setError(e instanceof TypeError ? 'No se pudo conectar. Revisa tu conexión o la URL del servidor (¿CORS?).' : e.message);
         } finally {
-          setLoading(false);
+          setStreaming(''); setStatus(''); setLoading(false);
         }
       };
+
+      const sendMessage = () => {
+        const text = input.trim();
+        if (!text || loading) return;
+        if (missingKey) { setError('Falta la API key. Configúrala en Ajustes.'); return; }
+        const list = [...messages, { role:'user', content:text }];
+        persist(list); setInput('');
+        run(list);
+      };
+      const retry = () => { if (!loading && messages.length) run(messages); };
+      const last = messages[messages.length - 1];
+      const canRetry = last && last.role !== 'assistant';
+
+      const bubble = (role, content, key) => (
+        <div key={key} style={{ display:'flex', justifyContent: role === 'user' ? 'flex-end' : 'flex-start', marginBottom:8 }}>
+          <div style={{ backgroundColor: role === 'user' ? '#007AFF' : '#e5e5ea', borderRadius:18, padding:'10px 14px', maxWidth:'80%' }}>
+            <p style={{ fontSize:15, color: role === 'user' ? '#fff' : '#000', margin:0, whiteSpace:'pre-wrap', wordBreak:'break-word' }}>{content}</p>
+          </div>
+        </div>
+      );
 
       return (
         <div style={{ display:'flex', flexDirection:'column', flex:1, overflow:'hidden' }}>
           <div style={{ backgroundColor:'#fff', padding:'10px 16px', borderBottom:'1px solid #eee', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-            <span style={{ fontWeight:'bold' }}>{agent.name}</span>
-            <span style={{ fontSize:12, color:'#888' }}>🧠 {agent.personality || 'Neutral'}</span>
+            <span style={{ fontSize:12, color:'#888' }}>🧠 {agent.personality || 'Neutral'} · {cfg.model.split('/').pop()}</span>
+            <button onClick={clearChat} disabled={!messages.length} style={{ background:'none', border:'none', color:'#FF3B30', cursor:'pointer', opacity: messages.length ? 1 : 0.4 }}>🗑 Borrar chat</button>
           </div>
 
           <div style={{ flex:1, overflowY:'auto', padding:10 }}>
-            {messages.length === 0 && <p style={{ textAlign:'center', color:'#aaa', marginTop:40 }}>Envía un mensaje para empezar.</p>}
-            {messages.map((m, i) => (
-              <div key={i} style={{ display:'flex', justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start', marginBottom:8 }}>
-                <div style={{ backgroundColor: m.role === 'user' ? '#007AFF' : '#e5e5ea', borderRadius:18, padding:'10px 14px', maxWidth:'80%' }}>
-                  <p style={{ fontSize:15, color: m.role === 'user' ? '#fff' : '#000', margin:0, whiteSpace:'pre-wrap' }}>{m.content}</p>
-                </div>
+            {missingKey && (
+              <div style={{ background:'#FFF3CD', borderRadius:10, padding:12, marginBottom:10, fontSize:14 }}>
+                ⚠️ Este modelo necesita una API key. <button onClick={() => navigate('Settings')} style={{ background:'none', border:'none', color:'#007AFF', cursor:'pointer', textDecoration:'underline', fontSize:14 }}>Ir a Ajustes</button>
               </div>
-            ))}
-            {loading && (
-              <div style={{ display:'flex', justifyContent:'flex-start', marginBottom:8 }}>
-                <div style={{ backgroundColor:'#e5e5ea', borderRadius:18, padding:'10px 14px' }}>
-                  <p style={{ margin:0, color:'#888' }}>...</p>
-                </div>
+            )}
+            {messages.length === 0 && <p style={{ textAlign:'center', color:'#aaa', marginTop:40 }}>Envía un mensaje para empezar.</p>}
+            {messages.map((m, i) => {
+              if (m.role === 'tool') return <p key={i} style={{ textAlign:'center', fontSize:12, color:'#888', margin:'4px 0 8px' }}>🔧 {m.tool}: {m.content.slice(0, 120)}{m.content.length > 120 ? '…' : ''}</p>;
+              const text = m.role === 'assistant' ? stripTool(m.content) : m.content;
+              return text ? bubble(m.role, text, i) : null;
+            })}
+            {streaming && bubble('assistant', streaming, 's')}
+            {loading && !streaming && <p style={{ textAlign:'center', fontSize:13, color:'#888' }}>{status || '...'}</p>}
+            {error && (
+              <div style={{ background:'#FFE5E3', color:'#B3261E', borderRadius:10, padding:12, marginBottom:8, fontSize:14 }}>
+                {error}
+                {canRetry && !loading && <button onClick={retry} style={{ marginLeft:8, background:'none', border:'none', color:'#007AFF', cursor:'pointer', textDecoration:'underline', fontSize:14 }}>Reintentar</button>}
               </div>
             )}
             <div ref={bottomRef} />
@@ -200,20 +404,19 @@
 
           <div style={{ display:'flex', padding:10, backgroundColor:'#fff', borderTop:'1px solid #ddd', gap:10 }}>
             <input
-              style={{ flex:1, border:'1px solid #ccc', borderRadius:20, padding:'10px 14px', fontSize:15, outline:'none' }}
+              style={{ flex:1, minWidth:0, border:'1px solid #ccc', borderRadius:20, padding:'10px 14px', fontSize:16, outline:'none' }}
               value={input} onChange={e => setInput(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && sendMessage()}
+              onKeyDown={e => e.key === 'Enter' && !e.nativeEvent.isComposing && sendMessage()}
               placeholder="Escribe tu mensaje..." disabled={loading} />
-            <button onClick={sendMessage} disabled={loading}
-              style={{ backgroundColor:'#007AFF', color:'white', border:'none', borderRadius:20, padding:'10px 18px', fontWeight:'bold', cursor:'pointer', opacity: loading ? 0.5 : 1 }}>
-              {loading ? '...' : 'Enviar'}
-            </button>
+            {loading
+              ? <button onClick={stop} style={{ backgroundColor:'#FF3B30', color:'white', border:'none', borderRadius:20, padding:'10px 18px', fontWeight:'bold', cursor:'pointer' }}>■</button>
+              : <button onClick={sendMessage} style={{ backgroundColor:'#007AFF', color:'white', border:'none', borderRadius:20, padding:'10px 18px', fontWeight:'bold', cursor:'pointer' }}>Enviar</button>}
           </div>
         </div>
       );
     }
 
-    ReactDOM.render(<App />, document.getElementById('root'));
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>
 </html>
