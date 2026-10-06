@@ -24,3 +24,8 @@ Botón ⇪ en cada agente:
 - **Enlace** para compartir: quien lo abra puede importar el agente.
 
 Botón "Importar agente": acepta nuestro JSON, JSON de estilo OpenAI, un enlace compartido o un prompt de texto.
+
+## Inspirado en
+- **Open WebUI**: agentes = modelo + prompt + parámetros + conocimiento. Aquí: creatividad (temperature), base de conocimiento con recuperación ligera (BM25-lite; inyecta todo si es pequeña, o los fragmentos más relevantes) y variables `{{FECHA}} {{HORA}} {{DIA}}`.
+- **LobeChat**: galería de agentes listos para añadir con un clic.
+- Chat con markdown seguro, copiar respuesta y regenerar.

@@ -84,9 +84,47 @@
       try { const c = JSON.parse(m[1]); return TOOLS[c.name] ? { name: c.name, args: c.args || {} } : { name: c.name, args: {}, invalid: true }; } catch { return { name:'?', args:{}, invalid: true }; }
     };
 
+    // ===== CONOCIMIENTO (RAG ligero, estilo Open WebUI) =====
+    const MAX_FILE = 150000, FULL_INJECT = 6000, TOP_K = 4;
+    const tokenize = (t) => (t.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').match(/[a-z0-9]{3,}/g) || []);
+    const chunkText = (text) => {
+      const out = []; let cur = '';
+      for (const p of text.split(/\n{2,}/)) {
+        if (cur && (cur + p).length > 800) { out.push(cur.trim()); cur = ''; }
+        cur += p + '\n\n';
+        while (cur.length > 1200) { out.push(cur.slice(0, 1000)); cur = cur.slice(1000); }
+      }
+      if (cur.trim()) out.push(cur.trim());
+      return out;
+    };
+    const retrieve = (agent, query) => {
+      const chunks = (agent.knowledge || []).flatMap(k => chunkText(k.text).map(c => ({ src:k.name, c })));
+      if (!chunks.length) return '';
+      let picked = chunks;
+      if (chunks.reduce((n, x) => n + x.c.length, 0) > FULL_INJECT) {
+        const q = [...new Set(tokenize(query))];
+        const toks = chunks.map(x => tokenize(x.c));
+        const df = {}; q.forEach(w => df[w] = toks.filter(t => t.includes(w)).length || 1);
+        picked = chunks.map((x, i) => ({ x, sc: q.reduce((a, w) => { const n = toks[i].filter(t => t === w).length; return a + (n ? (1 + Math.log(n)) / df[w] : 0); }, 0) }))
+          .filter(r => r.sc > 0).sort((a, b) => b.sc - a.sc).slice(0, TOP_K).map(r => r.x);
+      }
+      return picked.length ? `\n\nBase de conocimiento (usa esta información cuando sea relevante y cita la fuente entre corchetes):\n` + picked.map(x => `[${x.src}] ${x.c}`).join('\n---\n') : '';
+    };
+
+    // ===== GALERÍA DE AGENTES (estilo LobeChat) =====
+    const TEMPLATES = [
+      { name:'Traductor', emoji:'🌍', instructions:'Traduces cualquier texto que te den al idioma que te pida el usuario (por defecto español↔inglés). Devuelve solo la traducción, conservando tono y formato. Si hay ambigüedad, ofrece una alternativa breve.', personality:'Preciso', temperature:0.2, tools:[] },
+      { name:'Tutor de programación', emoji:'💻', instructions:'Eres un tutor paciente de programación. Explica paso a paso, con ejemplos de código cortos y correctos, y termina proponiendo un mini ejercicio. Hoy es {{FECHA}}.', personality:'Paciente y claro', temperature:0.4, tools:['calculadora'] },
+      { name:'Redactor de emails', emoji:'✉️', instructions:'Redactas emails profesionales a partir de ideas sueltas. Pregunta destinatario y objetivo solo si faltan; entrega asunto + cuerpo listos para enviar, breves y claros.', personality:'Profesional', temperature:0.6, tools:[] },
+      { name:'Coach de entrevistas', emoji:'🎤', instructions:'Simulas entrevistas de trabajo. Haces UNA pregunta a la vez, esperas la respuesta, y das feedback concreto (qué estuvo bien, qué mejorar) antes de la siguiente pregunta.', personality:'Exigente pero amable', temperature:0.7, tools:[] },
+      { name:'Asistente matemático', emoji:'🧮', instructions:'Resuelves problemas matemáticos mostrando el razonamiento. Usa SIEMPRE la calculadora para operaciones numéricas en lugar de calcular de memoria.', personality:'Riguroso', temperature:0.1, tools:['calculadora'] },
+      { name:'Investigador', emoji:'🔎', instructions:'Investigas temas usando Wikipedia, contrastas la información y resumes en puntos con la fuente. Indica claramente lo que no pudiste verificar. Fecha actual: {{FECHA}}.', personality:'Analítico', temperature:0.3, tools:['wikipedia','fecha_hora'] },
+    ];
+
     // ===== INTEROPERABILIDAD =====
+    const fillVars = (t) => t.replace(/\{\{\s*(FECHA|HORA|DIA)\s*\}\}/gi, (_, k) => { const d = new Date(); k = k.toUpperCase(); return k === 'FECHA' ? d.toLocaleDateString('es', { dateStyle:'long' }) : k === 'HORA' ? d.toLocaleTimeString('es') : d.toLocaleDateString('es', { weekday:'long' }); });
     const buildSystem = (agent, withToolProtocol = true) =>
-      `Eres un agente de IA llamado "${agent.name}". Instrucciones: ${agent.instructions}. Personalidad: ${agent.personality || 'Neutral'}. Responde siempre en el idioma del usuario.` + (withToolProtocol ? toolsPrompt(agent.tools) : '');
+      `Eres un agente de IA llamado "${agent.name}". Instrucciones: ${fillVars(agent.instructions)}. Personalidad: ${agent.personality || 'Neutral'}. Responde siempre en el idioma del usuario.` + (withToolProtocol ? toolsPrompt(agent.tools) : '');
     const TOOL_PARAMS = {
       calculadora: { type:'object', properties:{ expression:{ type:'string', description:'Expresión matemática, ej. 2*(3+4)' } }, required:['expression'] },
       fecha_hora:  { type:'object', properties:{} },
@@ -96,7 +134,7 @@
     // Formato portable (OpenAI-compatible): sirve para cualquier app/API que acepte system prompt + tools
     const exportAgent = (agent) => ({
       format:'agente-ia', version:1,
-      name:agent.name, instructions:agent.instructions, personality:agent.personality || 'Neutral', tools:agent.tools || [],
+      name:agent.name, instructions:agent.instructions, personality:agent.personality || 'Neutral', tools:agent.tools || [], temperature:agent.temperature ?? 0.7, knowledge:agent.knowledge || [],
       system_prompt: buildSystem(agent, false),
       openai: { messages:[{ role:'system', content: buildSystem(agent, false) }], tools: toolSchemas(agent.tools) },
     });
@@ -110,7 +148,8 @@
       const sys = o.instructions || o.system_prompt || o.system || o.prompt || o.openai?.messages?.find(m => m.role === 'system')?.content;
       if (!sys) throw new Error('No encontré instrucciones en el contenido.');
       const toolIds = (o.tools || []).map(x => typeof x === 'string' ? x : x?.function?.name || x?.name).filter(id => TOOLS[id]);
-      return { name:String(o.name || 'Agente importado').slice(0, 60), instructions:String(sys), personality:String(o.personality || 'Neutral'), tools:[...new Set(toolIds)] };
+      const k = Array.isArray(o.knowledge) ? o.knowledge.filter(x => x && typeof x.text === 'string').map(x => ({ name:String(x.name || 'doc').slice(0, 60), text:x.text.slice(0, MAX_FILE) })) : [];
+      return { name:String(o.name || 'Agente importado').slice(0, 60), instructions:String(sys), personality:String(o.personality || 'Neutral'), tools:[...new Set(toolIds)], temperature: typeof o.temperature === 'number' ? Math.min(1.5, Math.max(0, o.temperature)) : 0.7, knowledge:k };
     };
     const encodeShare = (agent) => btoa(unescape(encodeURIComponent(JSON.stringify({ name:agent.name, instructions:agent.instructions, personality:agent.personality, tools:agent.tools || [] })))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
     const decodeShare = (b) => { try { return JSON.parse(decodeURIComponent(escape(atob(b.replace(/-/g,'+').replace(/_/g,'/'))))); } catch { return null; } };
@@ -135,21 +174,21 @@
     }
     const httpError = (status, msg) => new Error(status === 401 ? 'API key inválida (401). Revísala en Ajustes.' : status === 402 ? 'Saldo insuficiente (402).' : status === 429 ? 'Demasiadas peticiones (429). Espera un momento.' : msg || `Error HTTP ${status}`);
 
-    async function streamCompletion({ cfg, messages, onToken, signal }) {
+    async function streamCompletion({ cfg, messages, onToken, signal, temperature = 0.7 }) {
       let full = '';
       if (cfg.provider === 'webllm') {
         const engine = await getWebllm(cfg.model);
         const onAbort = () => engine.interruptGenerate();
         signal.addEventListener('abort', onAbort);
         try {
-          const chunks = await engine.chat.completions.create({ messages, stream:true, max_tokens:1000 });
+          const chunks = await engine.chat.completions.create({ messages, stream:true, max_tokens:1000, temperature });
           for await (const c of chunks) { const t = c.choices[0]?.delta?.content || ''; full += t; onToken(full); }
         } finally { signal.removeEventListener('abort', onAbort); }
         return full;
       }
       const headers = { 'Content-Type':'application/json' };
       if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
-      const resp = await fetch(`${cfg.baseUrl.replace(/\/+$/, '')}/chat/completions`, { method:'POST', signal, headers, body: JSON.stringify({ model: cfg.model, messages, stream:true, max_tokens:1000 }) });
+      const resp = await fetch(`${cfg.baseUrl.replace(/\/+$/, '')}/chat/completions`, { method:'POST', signal, headers, body: JSON.stringify({ model: cfg.model, messages, stream:true, max_tokens:1000, temperature }) });
       if (!resp.ok) { const d = await resp.json().catch(() => ({})); throw httpError(resp.status, d?.error?.message); }
       const reader = resp.body.getReader(), dec = new TextDecoder();
       let buf = '';
@@ -197,6 +236,36 @@
       );
     }
 
+    // ===== MARKDOWN SEGURO (sin dangerouslySetInnerHTML) =====
+    function Inline({ text }) {
+      const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`|\*[^*\s][^*]*\*|\[[^\]]+\]\(https?:\/\/[^)\s]+\))/g);
+      return parts.map((p, i) => {
+        if (/^\*\*[^*]+\*\*$/.test(p)) return <b key={i}>{p.slice(2, -2)}</b>;
+        if (/^`[^`]+`$/.test(p)) return <code key={i} style={{ background:'#d8d8de', borderRadius:4, padding:'1px 4px', fontSize:13 }}>{p.slice(1, -1)}</code>;
+        if (/^\*[^*]+\*$/.test(p)) return <i key={i}>{p.slice(1, -1)}</i>;
+        const m = p.match(/^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/);
+        if (m) return <a key={i} href={m[2]} target="_blank" rel="noopener noreferrer" style={{ color:'#007AFF' }}>{m[1]}</a>;
+        return p;
+      });
+    }
+    function Md({ text }) {
+      const blocks = text.split(/```/);
+      return blocks.map((b, i) => {
+        if (i % 2) {
+          const code = b.replace(/^[^\n]*\n/, '');
+          return <pre key={i} style={{ background:'#1e1e2e', color:'#e6e6f0', borderRadius:8, padding:10, overflowX:'auto', fontSize:13, margin:'6px 0' }}><code>{code.replace(/\n$/, '')}</code></pre>;
+        }
+        return b.split('\n').map((line, j) => {
+          if (!line.trim()) return <div key={`${i}-${j}`} style={{ height:6 }} />;
+          const h = line.match(/^#{1,4}\s+(.*)/);
+          if (h) return <p key={`${i}-${j}`} style={{ fontWeight:700, margin:'4px 0' }}><Inline text={h[1]} /></p>;
+          const li = line.match(/^\s*([-*]|\d+\.)\s+(.*)/);
+          if (li) return <p key={`${i}-${j}`} style={{ margin:'2px 0', paddingLeft:14, textIndent:-14 }}>{/\d/.test(li[1]) ? li[1] : '•'} <Inline text={li[2]} /></p>;
+          return <p key={`${i}-${j}`} style={{ margin:'2px 0' }}><Inline text={line} /></p>;
+        });
+      });
+    }
+
     // ===== MODALES =====
     const btn = (bg) => ({ backgroundColor:bg, color:'white', border:'none', borderRadius:8, padding:'10px 12px', fontSize:14, cursor:'pointer', fontWeight:600 });
     function Modal({ title, onClose, children }) {
@@ -242,6 +311,22 @@
         </Modal>
       );
     }
+    function GalleryModal({ onClose, onDone }) {
+      const add = (t) => { const { emoji, ...data } = t; saveImported({ ...data, name:`${emoji} ${t.name}` }); onDone(); };
+      return (
+        <Modal title="Galería de agentes" onClose={onClose}>
+          {TEMPLATES.map(t => (
+            <div key={t.name} style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 0', borderBottom:'1px solid #eee' }}>
+              <div style={{ flex:1 }}>
+                <b>{t.emoji} {t.name}</b>
+                <p style={{ fontSize:12, color:'#666', margin:'2px 0 0' }}>{t.instructions.slice(0, 90)}…</p>
+              </div>
+              <button style={btn('#34C759')} onClick={() => add(t)}>Añadir</button>
+            </div>
+          ))}
+        </Modal>
+      );
+    }
     function ImportModal({ initial, onClose, onDone }) {
       const [text, setText] = useState(initial || '');
       const [err, setErr] = useState('');
@@ -262,6 +347,7 @@
     function HomeScreen({ navigate }) {
       const [agents, setAgents] = useState([]);
       const [exporting, setExporting] = useState(null);
+      const [gallery, setGallery] = useState(false);
       const [importing, setImporting] = useState(() => /#import=/.test(location.hash) ? decodeURIComponent(location.hash.slice(1)) : false);
 
       useEffect(() => {
@@ -286,6 +372,11 @@
             style={{ backgroundColor:'#fff', color:'#007AFF', fontSize:15, fontWeight:600, padding:10, borderRadius:10, border:'1px solid #007AFF', width:'100%', cursor:'pointer', marginBottom:20, marginTop:-8 }}>
             ⬇️ Importar agente
           </button>
+          <button onClick={() => setGallery(true)}
+            style={{ backgroundColor:'#fff', color:'#5856D6', fontSize:15, fontWeight:600, padding:10, borderRadius:10, border:'1px solid #5856D6', width:'100%', cursor:'pointer', marginBottom:20, marginTop:-8 }}>
+            ✨ Galería de agentes
+          </button>
+          {gallery && <GalleryModal onClose={() => setGallery(false)} onDone={() => { setGallery(false); setAgents(readJSON('agents', [])); }} />}
           {exporting && <ExportModal agent={exporting} onClose={() => setExporting(null)} />}
           {importing && <ImportModal initial={typeof importing === 'string' ? importing : ''} onClose={() => { setImporting(false); if (location.hash) history.replaceState(null, '', location.pathname); }}
             onDone={() => { setImporting(false); history.replaceState(null, '', location.pathname); setAgents(readJSON('agents', [])); }} />}
@@ -293,7 +384,7 @@
           {agents.length === 0 ? (
             <div style={{ textAlign:'center', marginTop:100 }}>
               <p style={{ fontSize:18, color:'#888' }}>No tienes agentes creados.</p>
-              <p style={{ fontSize:14, color:'#aaa', marginTop:10 }}>Toca "Crear Nuevo Agente" para empezar.</p>
+              <p style={{ fontSize:14, color:'#aaa', marginTop:10 }}>Crea uno, o añade uno de la galería.</p>
             </div>
           ) : agents.map(item => (
             <div key={item.id} style={{ display:'flex', backgroundColor:'#fff', borderRadius:10, padding:15, marginBottom:10, alignItems:'center', boxShadow:'0 1px 4px rgba(0,0,0,0.08)' }}>
@@ -320,11 +411,21 @@
       const [instructions, setInstructions] = useState(agent?.instructions || '');
       const [personality, setPersonality] = useState(agent?.personality && agent.personality !== 'Neutral' ? agent.personality : '');
       const [tools, setTools] = useState(agent?.tools || []);
+      const [temperature, setTemperature] = useState(agent?.temperature ?? 0.7);
+      const [knowledge, setKnowledge] = useState(agent?.knowledge || []);
+      const addFiles = async (e) => {
+        const added = [];
+        for (const f of e.target.files) {
+          if (f.size > MAX_FILE) { alert(`${f.name} supera ${MAX_FILE / 1000} KB`); continue; }
+          added.push({ name:f.name, text:await f.text() });
+        }
+        setKnowledge(k => [...k, ...added]); e.target.value = '';
+      };
       const toggleTool = (id) => setTools(t => t.includes(id) ? t.filter(x => x !== id) : [...t, id]);
 
       const saveAgent = () => {
         if (!name.trim() || !instructions.trim()) { alert('Nombre e instrucciones son obligatorios'); return; }
-        const data = { name: name.trim(), instructions: instructions.trim(), personality: personality.trim() || 'Neutral', tools };
+        const data = { name: name.trim(), instructions: instructions.trim(), personality: personality.trim() || 'Neutral', tools, temperature, knowledge };
         const agents = readJSON('agents', []);
         const next = agent
           ? agents.map(a => a.id === agent.id ? { ...a, ...data } : a)
@@ -345,6 +446,20 @@
 
           <label style={{ fontSize:16, fontWeight:'bold', display:'block', marginTop:15, marginBottom:5 }}>Personalidad (opcional)</label>
           <input style={inputStyle} value={personality} onChange={e => setPersonality(e.target.value)} placeholder="Ej: Formal, Amigable, Irónico" />
+
+          <label style={{ fontSize:16, fontWeight:'bold', display:'block', marginTop:15, marginBottom:5 }}>Creatividad: {temperature.toFixed(1)}</label>
+          <input type="range" min="0" max="1.5" step="0.1" value={temperature} onChange={e => setTemperature(+e.target.value)} style={{ width:'100%' }} />
+          <p style={{ fontSize:12, color:'#888', marginBottom:10 }}>Bajo = preciso y estable · Alto = creativo. Variables: {'{{FECHA}} {{HORA}} {{DIA}}'} en las instrucciones.</p>
+
+          <label style={{ fontSize:16, fontWeight:'bold', display:'block', marginTop:15, marginBottom:5 }}>Base de conocimiento</label>
+          <input type="file" multiple accept=".txt,.md,.csv,.json" onChange={addFiles} />
+          {knowledge.map((k, i) => (
+            <div key={i} style={{ display:'flex', justifyContent:'space-between', fontSize:14, padding:'6px 0' }}>
+              <span>📄 {k.name} ({Math.round(k.text.length / 1000)} KB)</span>
+              <button onClick={() => setKnowledge(knowledge.filter((_, j) => j !== i))} style={{ background:'none', border:'none', color:'#FF3B30', cursor:'pointer' }}>Quitar</button>
+            </div>
+          ))}
+          <p style={{ fontSize:12, color:'#888', marginBottom:10 }}>El agente responderá usando estos documentos (.txt, .md, .csv, .json) y citará la fuente.</p>
 
           <label style={{ fontSize:16, fontWeight:'bold', display:'block', marginTop:15, marginBottom:5 }}>Herramientas</label>
           {Object.entries(TOOLS).map(([id, t]) => (
@@ -437,11 +552,12 @@
         setError(''); setLoading(true);
         onWebllmProgress = (t) => setStatus(t);
         let list = startList;
-        const system = buildSystem(agent);
+        const lastUser = [...startList].reverse().find(m => m.role === 'user');
+        const system = buildSystem(agent) + retrieve(agent, lastUser?.content || '');
         try {
           for (let step = 0; step <= MAX_TOOL_STEPS; step++) {
             setStatus(cfg.provider === 'webllm' && !webllmEngine ? 'Cargando modelo…' : '');
-            const text = await streamCompletion({ cfg, signal: controller.signal, onToken: (t) => { setStatus(''); setStreaming(stripTool(t)); }, messages: [{ role:'system', content:system }, ...toApi(list)] });
+            const text = await streamCompletion({ cfg, signal: controller.signal, temperature: agent.temperature ?? 0.7, onToken: (t) => { setStatus(''); setStreaming(stripTool(t)); }, messages: [{ role:'system', content:system }, ...toApi(list)] });
             setStreaming('');
             list = [...list, { role:'assistant', content:text }];
             persist(list);
@@ -472,13 +588,23 @@
         run(list);
       };
       const retry = () => { if (!loading && messages.length) run(messages); };
+      const regenerate = () => {
+        if (loading) return;
+        const idx = messages.map(m => m.role).lastIndexOf('user');
+        if (idx < 0) return;
+        const list = messages.slice(0, idx + 1);
+        persist(list); run(list);
+      };
       const last = messages[messages.length - 1];
       const canRetry = last && last.role !== 'assistant';
 
       const bubble = (role, content, key) => (
         <div key={key} style={{ display:'flex', justifyContent: role === 'user' ? 'flex-end' : 'flex-start', marginBottom:8 }}>
           <div style={{ backgroundColor: role === 'user' ? '#007AFF' : '#e5e5ea', borderRadius:18, padding:'10px 14px', maxWidth:'80%' }}>
-            <p style={{ fontSize:15, color: role === 'user' ? '#fff' : '#000', margin:0, whiteSpace:'pre-wrap', wordBreak:'break-word' }}>{content}</p>
+            {role === 'user'
+              ? <p style={{ fontSize:15, color:'#fff', margin:0, whiteSpace:'pre-wrap', wordBreak:'break-word' }}>{content}</p>
+              : <div style={{ fontSize:15, color:'#000', wordBreak:'break-word' }}><Md text={content} /></div>}
+            {role === 'assistant' && key !== 's' && <button onClick={() => copyText(content)} title="Copiar" style={{ background:'none', border:'none', cursor:'pointer', fontSize:12, color:'#888', padding:'4px 0 0' }}>📋 Copiar</button>}
           </div>
         </div>
       );
@@ -504,6 +630,7 @@
             })}
             {streaming && bubble('assistant', streaming, 's')}
             {loading && !streaming && <p style={{ textAlign:'center', fontSize:13, color:'#888' }}>{status || '...'}</p>}
+            {last?.role === 'assistant' && !loading && !streaming && <div style={{ textAlign:'center' }}><button onClick={regenerate} style={{ background:'none', border:'1px solid #ccc', borderRadius:14, padding:'4px 12px', cursor:'pointer', fontSize:13, color:'#555' }}>↻ Regenerar</button></div>}
             {error && (
               <div style={{ background:'#FFE5E3', color:'#B3261E', borderRadius:10, padding:12, marginBottom:8, fontSize:14 }}>
                 {error}
