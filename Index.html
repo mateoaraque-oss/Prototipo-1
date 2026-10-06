@@ -84,6 +84,45 @@
       try { const c = JSON.parse(m[1]); return TOOLS[c.name] ? { name: c.name, args: c.args || {} } : { name: c.name, args: {}, invalid: true }; } catch { return { name:'?', args:{}, invalid: true }; }
     };
 
+    // ===== INTEROPERABILIDAD =====
+    const buildSystem = (agent, withToolProtocol = true) =>
+      `Eres un agente de IA llamado "${agent.name}". Instrucciones: ${agent.instructions}. Personalidad: ${agent.personality || 'Neutral'}. Responde siempre en el idioma del usuario.` + (withToolProtocol ? toolsPrompt(agent.tools) : '');
+    const TOOL_PARAMS = {
+      calculadora: { type:'object', properties:{ expression:{ type:'string', description:'Expresión matemática, ej. 2*(3+4)' } }, required:['expression'] },
+      fecha_hora:  { type:'object', properties:{} },
+      wikipedia:   { type:'object', properties:{ query:{ type:'string', description:'Tema a buscar' } }, required:['query'] },
+    };
+    const toolSchemas = (ids = []) => ids.filter(id => TOOLS[id]).map(id => ({ type:'function', function:{ name:id, description:TOOLS[id].desc.split(' args:')[0], parameters:TOOL_PARAMS[id] } }));
+    // Formato portable (OpenAI-compatible): sirve para cualquier app/API que acepte system prompt + tools
+    const exportAgent = (agent) => ({
+      format:'agente-ia', version:1,
+      name:agent.name, instructions:agent.instructions, personality:agent.personality || 'Neutral', tools:agent.tools || [],
+      system_prompt: buildSystem(agent, false),
+      openai: { messages:[{ role:'system', content: buildSystem(agent, false) }], tools: toolSchemas(agent.tools) },
+    });
+    // Acepta nuestro JSON, y también formatos ajenos: {name,instructions}, {system}, {system_prompt}, {openai:{messages}}, OpenAI Assistants...
+    const parseImport = (text) => {
+      const t = text.trim();
+      let o = null;
+      try { o = JSON.parse(t); } catch {}
+      if (!o) { const m = t.match(/#import=([\w-]+)/); if (m) o = decodeShare(m[1]); }
+      if (!o) { if (!t) throw new Error('Pega un JSON, un enlace o un prompt.'); o = { name:'Agente importado', instructions:t }; }
+      const sys = o.instructions || o.system_prompt || o.system || o.prompt || o.openai?.messages?.find(m => m.role === 'system')?.content;
+      if (!sys) throw new Error('No encontré instrucciones en el contenido.');
+      const toolIds = (o.tools || []).map(x => typeof x === 'string' ? x : x?.function?.name || x?.name).filter(id => TOOLS[id]);
+      return { name:String(o.name || 'Agente importado').slice(0, 60), instructions:String(sys), personality:String(o.personality || 'Neutral'), tools:[...new Set(toolIds)] };
+    };
+    const encodeShare = (agent) => btoa(unescape(encodeURIComponent(JSON.stringify({ name:agent.name, instructions:agent.instructions, personality:agent.personality, tools:agent.tools || [] })))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+    const decodeShare = (b) => { try { return JSON.parse(decodeURIComponent(escape(atob(b.replace(/-/g,'+').replace(/_/g,'/'))))); } catch { return null; } };
+    const saveImported = (data) => {
+      const agents = readJSON('agents', []);
+      const a = { id: Date.now().toString() + Math.random().toString(36).slice(2, 6), ...data };
+      storage.setItem('agents', JSON.stringify([...agents, a]));
+      return a;
+    };
+    const copyText = async (t) => { try { await navigator.clipboard.writeText(t); return true; } catch { return false; } };
+    const downloadFile = (name, text) => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type:'application/json' })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); };
+
     // ===== MOTOR LLM =====
     let webllmEngine = null, webllmModel = null, onWebllmProgress = () => {};
     async function getWebllm(model) {
@@ -158,9 +197,72 @@
       );
     }
 
+    // ===== MODALES =====
+    const btn = (bg) => ({ backgroundColor:bg, color:'white', border:'none', borderRadius:8, padding:'10px 12px', fontSize:14, cursor:'pointer', fontWeight:600 });
+    function Modal({ title, onClose, children }) {
+      return (
+        <div onClick={onClose} style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.45)', display:'flex', alignItems:'flex-end', justifyContent:'center', zIndex:10 }}>
+          <div onClick={e => e.stopPropagation()} style={{ background:'#fff', width:'100%', maxWidth:480, maxHeight:'85vh', overflowY:'auto', borderRadius:'16px 16px 0 0', padding:20 }}>
+            <div style={{ display:'flex', justifyContent:'space-between', marginBottom:12 }}>
+              <b style={{ fontSize:17 }}>{title}</b>
+              <button onClick={onClose} style={{ background:'none', border:'none', fontSize:20, cursor:'pointer' }}>✕</button>
+            </div>
+            {children}
+          </div>
+        </div>
+      );
+    }
+    function ExportModal({ agent, onClose }) {
+      const [msg, setMsg] = useState('');
+      const json = JSON.stringify(exportAgent(agent), null, 2);
+      const prompt = buildSystem(agent, false);
+      const link = `${location.origin}${location.pathname}#import=${encodeShare(agent)}`;
+      const curl = `curl https://api.openai.com/v1/chat/completions \\\n  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \\\n  -d '${JSON.stringify({ model:'MODELO', messages:[...exportAgent(agent).openai.messages, { role:'user', content:'Hola' }], tools: toolSchemas(agent.tools) })}'`;
+      const copy = async (t, what) => setMsg(await copyText(t) ? `✅ ${what} copiado` : 'No se pudo copiar');
+      const q = encodeURIComponent(prompt + '\n\nPresenta tu rol y pregúntame en qué puedes ayudarme.');
+      const row = { display:'flex', flexWrap:'wrap', gap:8, marginBottom:12 };
+      return (
+        <Modal title={`Compartir "${agent.name}"`} onClose={onClose}>
+          <p style={{ fontSize:13, color:'#666', marginBottom:12 }}>Usa este agente en cualquier app de IA.</p>
+          <b style={{ fontSize:14 }}>Pegar en ChatGPT, Claude, Gemini, etc.</b>
+          <div style={row}>
+            <button style={btn('#007AFF')} onClick={() => copy(prompt, 'Prompt')}>Copiar prompt</button>
+            <a style={{ ...btn('#10A37F'), textDecoration:'none' }} href={`https://chatgpt.com/?q=${q}`} target="_blank" rel="noopener noreferrer">Abrir en ChatGPT</a>
+            <a style={{ ...btn('#D97757'), textDecoration:'none' }} href={`https://claude.ai/new?q=${q}`} target="_blank" rel="noopener noreferrer">Abrir en Claude</a>
+          </div>
+          <b style={{ fontSize:14 }}>Para desarrolladores / otras apps</b>
+          <div style={row}>
+            <button style={btn('#5856D6')} onClick={() => downloadFile(`${agent.name.replace(/\W+/g, '_')}.agent.json`, json)}>Descargar JSON</button>
+            <button style={btn('#5856D6')} onClick={() => copy(json, 'JSON')}>Copiar JSON</button>
+            <button style={btn('#5856D6')} onClick={() => copy(curl, 'cURL')}>Copiar cURL (OpenAI API)</button>
+          </div>
+          <b style={{ fontSize:14 }}>Compartir con otra persona</b>
+          <div style={row}><button style={btn('#34C759')} onClick={() => copy(link, 'Enlace')}>Copiar enlace</button></div>
+          {msg && <p style={{ fontSize:13, color:'#34C759' }}>{msg}</p>}
+        </Modal>
+      );
+    }
+    function ImportModal({ initial, onClose, onDone }) {
+      const [text, setText] = useState(initial || '');
+      const [err, setErr] = useState('');
+      const go = () => { try { saveImported(parseImport(text)); onDone(); } catch (e) { setErr(e.message); } };
+      const onFile = async (e) => { const f = e.target.files[0]; if (f) setText(await f.text()); };
+      return (
+        <Modal title="Importar agente" onClose={onClose}>
+          <p style={{ fontSize:13, color:'#666', marginBottom:8 }}>Pega un JSON (de esta app, OpenAI u otra), un enlace compartido o simplemente un prompt de sistema.</p>
+          <textarea value={text} onChange={e => { setText(e.target.value); setErr(''); }} style={{ width:'100%', height:120, border:'1px solid #ccc', borderRadius:8, padding:10, fontSize:14, fontFamily:'inherit' }} />
+          <input type="file" accept=".json,.txt,.md" onChange={onFile} style={{ margin:'8px 0' }} />
+          {err && <p style={{ color:'#B3261E', fontSize:13, marginBottom:8 }}>{err}</p>}
+          <button style={{ ...btn('#34C759'), width:'100%', padding:14, fontSize:16 }} onClick={go}>Importar</button>
+        </Modal>
+      );
+    }
+
     // ===== HOME =====
     function HomeScreen({ navigate }) {
       const [agents, setAgents] = useState([]);
+      const [exporting, setExporting] = useState(null);
+      const [importing, setImporting] = useState(() => /#import=/.test(location.hash) ? decodeURIComponent(location.hash.slice(1)) : false);
 
       useEffect(() => {
         setAgents(readJSON('agents', []));
@@ -180,6 +282,13 @@
             style={{ backgroundColor:'#007AFF', color:'white', fontSize:18, fontWeight:'bold', padding:15, borderRadius:10, border:'none', width:'100%', cursor:'pointer', marginBottom:20 }}>
             + Crear Nuevo Agente
           </button>
+          <button onClick={() => setImporting(true)}
+            style={{ backgroundColor:'#fff', color:'#007AFF', fontSize:15, fontWeight:600, padding:10, borderRadius:10, border:'1px solid #007AFF', width:'100%', cursor:'pointer', marginBottom:20, marginTop:-8 }}>
+            ⬇️ Importar agente
+          </button>
+          {exporting && <ExportModal agent={exporting} onClose={() => setExporting(null)} />}
+          {importing && <ImportModal initial={typeof importing === 'string' ? importing : ''} onClose={() => { setImporting(false); if (location.hash) history.replaceState(null, '', location.pathname); }}
+            onDone={() => { setImporting(false); history.replaceState(null, '', location.pathname); setAgents(readJSON('agents', [])); }} />}
 
           {agents.length === 0 ? (
             <div style={{ textAlign:'center', marginTop:100 }}>
@@ -193,6 +302,8 @@
                 <p style={{ fontSize:14, color:'#666', marginBottom:4 }}>{item.instructions.slice(0,80)}...</p>
                 <p style={{ fontSize:12, color:'#888' }}>🧠 {item.personality || 'Neutral'}{item.tools?.length ? ` · 🔧 ${item.tools.length}` : ''}</p>
               </div>
+              <button onClick={() => setExporting(item)} title="Compartir / exportar"
+                style={{ backgroundColor:'#007AFF', color:'white', border:'none', borderRadius:'50%', width:30, height:30, cursor:'pointer', fontSize:14, marginRight:8 }}>⇪</button>
               <button onClick={() => navigate('CreateAgent', { agent: item })} title="Editar"
                 style={{ backgroundColor:'#8E8E93', color:'white', border:'none', borderRadius:'50%', width:30, height:30, cursor:'pointer', fontSize:14, marginRight:8 }}>✎</button>
               <button onClick={() => deleteAgent(item.id)}
@@ -326,7 +437,7 @@
         setError(''); setLoading(true);
         onWebllmProgress = (t) => setStatus(t);
         let list = startList;
-        const system = `Eres un agente de IA llamado "${agent.name}". Instrucciones: ${agent.instructions}. Personalidad: ${agent.personality || 'Neutral'}. Responde siempre en el idioma del usuario.` + toolsPrompt(agent.tools);
+        const system = buildSystem(agent);
         try {
           for (let step = 0; step <= MAX_TOOL_STEPS; step++) {
             setStatus(cfg.provider === 'webllm' && !webllmEngine ? 'Cargando modelo…' : '');

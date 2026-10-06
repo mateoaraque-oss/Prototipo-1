@@ -15,3 +15,12 @@ Es un sitio estático: súbelo a GitHub Pages, Netlify o Vercel (Settings → Pa
 
 ## Seguridad
 Nunca pongas una API key en el código. Una key anterior estuvo en el historial del repo: **revócala** en platform.deepseek.com.
+
+## Compatibilidad con otras apps de IA
+Botón ⇪ en cada agente:
+- **Prompt** para pegar en ChatGPT / Claude / Gemini (o abrirlo directo en ChatGPT y Claude).
+- **JSON portable** (`.agent.json`) con system prompt y herramientas en formato OpenAI function-calling.
+- **cURL** listo para cualquier API compatible con OpenAI.
+- **Enlace** para compartir: quien lo abra puede importar el agente.
+
+Botón "Importar agente": acepta nuestro JSON, JSON de estilo OpenAI, un enlace compartido o un prompt de texto.
